@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.venv/
+work/
+*.sqlite3
+*.sqlite3-journal
+references/local-runtime.md

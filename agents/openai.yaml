@@ -1,0 +1,4 @@
+interface:
+  display_name: "Higgsfield API"
+  short_description: "Generate media through documented Higgsfield APIs"
+  default_prompt: "Use $higgsfield-api to create media for this project, checking the chosen model's current documentation and estimating its cost first."
