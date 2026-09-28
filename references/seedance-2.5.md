@@ -23,4 +23,6 @@ Example input, saved as a project JSON file:
 
 The export describes token-metered pricing based on duration, pixel dimensions and model rate, before customer discounts. Do not assume the advertised starting per-second price applies to every resolution, aspect ratio, or account. Use the authenticated `/estimate/<model>` response for the exact submitted inputs.
 
+As of 2026-09-28 that response carries no `usd` field, only a fixed text `pricing_description` quoting 16:9 per-second rates. The profile's `pricing` block tells the helper to multiply the quoted rate for the requested resolution by the duration; the output's `estimate_basis` says so and marks non-16:9 figures as approximate. If the text changes shape the estimate fails and nothing is submitted.
+
 Write visual prompts with a concrete subject, action, environment and camera movement. Match scene complexity to duration. For motion explainers, generate visual scenes and assemble precise labels, equations and timing with the project's editing tools unless the user explicitly wants them baked into the generated video.
