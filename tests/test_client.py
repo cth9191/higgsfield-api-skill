@@ -26,7 +26,7 @@ class FakeClient:
         self.calls = []
         self.responses = list(responses or [])
 
-    def estimate(self, model, payload):
+    def estimate(self, model, payload, profile=None):
         return hf.money(self.cost)
 
     def request(self, method, url, payload=None, timeout=30):
@@ -194,13 +194,21 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.store.get("shot", self.client.owner)["status"], "queued")
 
     def test_bad_status_url_never_receives_credentials(self):
-        self.client.responses = [{"request_id": RID, "status": "queued", "status_url": "https://evil.example/status"}]
+        self.client.responses = [{"request_id": RID, "status": "queued", "status_url": "https://evil.example/status"},
+                                 {"request_id": RID, "status": "queued"}]
+        self.submit()
+        job = self.store.get("shot", self.client.owner)
+        self.assertEqual((job["status"], job["request_id"], job["status_url"]), ("queued", RID, URL))
+        hf.status_job(self.store, self.client, "shot")
+        self.assertEqual([url for _, url in self.client.calls], [f"{hf.BASE}/{PROFILE['model']}", URL])
+
+    def test_raw_acceptance_is_kept_when_validation_fails(self):
+        self.client.responses = [{"request_id": "not-a-uuid", "status": "queued"}]
         with self.assertRaises(hf.ClientError):
             self.submit()
-        self.assertEqual(self.store.get("shot", self.client.owner)["status"], "unknown")
-        with self.assertRaises(hf.ClientError):
-            hf.status_job(self.store, self.client, "shot")
-        self.assertEqual(len(self.client.calls), 1)
+        job = self.store.get("shot", self.client.owner)
+        self.assertEqual(job["status"], "unknown")
+        self.assertIn("not-a-uuid", job["response_json"])
 
     def test_attach_recovers_unknown_job(self):
         self.client.responses = [hf.ApiError()]
@@ -267,16 +275,49 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.estimate(PROFILE["model"], INPUT), hf.money("1.23"))
             self.assertEqual(requests[0].get_header("Authorization"), "Key test-key:test-secret")
             self.assertEqual(requests[0].get_header("Content-type"), "application/json")
+            self.assertEqual(requests[0].get_header("User-agent"), hf.USER_AGENT)
             with self.assertRaises(hf.ClientError):
                 client.request("GET", "https://other.example/status")
             self.assertEqual(len(requests), 1)
+
+    DESCRIPTION = {"type": "description", "pricing_description": "For 16:9 video without video input, your request costs roughly $0.2056 per second of generated video at 480p, $0.4622 at 720p, and $1.1372 at 1080p. Each 1,000 video tokens costs $0.0214 at 480p or 720p and $0.0234 at 1080p."}
+
+    def described_client(self, response):
+        client = object.__new__(hf.Client)
+        client.request = lambda *args, **kwargs: response
+        return client
+
+    def test_text_estimate_uses_published_rate_times_duration(self):
+        client = self.described_client(self.DESCRIPTION)
+        self.assertEqual(client.estimate(PROFILE["model"], INPUT, PROFILE), hf.money("2.3110"))
+        self.assertTrue(client.estimate_basis.startswith("computed"))
+        self.assertNotIn("approximate", client.estimate_basis)
+        cost = client.estimate(PROFILE["model"], INPUT | {"resolution": "480p", "duration": 10, "aspect_ratio": "9:16"}, PROFILE)
+        self.assertEqual(cost, hf.money("2.056"))
+        self.assertIn("approximate for 9:16", client.estimate_basis)
+
+    def test_text_estimate_defaults_come_from_schema(self):
+        client = self.described_client(self.DESCRIPTION)
+        self.assertEqual(client.estimate(PROFILE["model"], {"prompt": "x"}, PROFILE), hf.money("2.3110"))
+
+    def test_api_usd_wins_over_computed(self):
+        client = self.described_client(self.DESCRIPTION | {"usd": "9.99"})
+        self.assertEqual(client.estimate(PROFILE["model"], INPUT, PROFILE), hf.money("9.99"))
+        self.assertEqual(client.estimate_basis, "api")
+
+    def test_text_estimate_fails_closed(self):
+        changed = {"type": "description", "pricing_description": "Pricing now depends on your plan."}
+        missing = {"type": "description", "pricing_description": "For 16:9 video, your request costs roughly $0.2056 per second of generated video at 480p."}
+        for response, profile in ((changed, PROFILE), (missing, PROFILE), (self.DESCRIPTION, {k: v for k, v in PROFILE.items() if k != "pricing"})):
+            with self.assertRaises(hf.ClientError):
+                self.described_client(response).estimate(PROFILE["model"], INPUT, profile)
 
     def test_concurrent_submissions_only_one_post(self):
         barrier = threading.Barrier(2)
         calls = []
         errors = []
         class RacingClient(FakeClient):
-            def estimate(self, model, payload):
+            def estimate(self, model, payload, profile=None):
                 barrier.wait(timeout=5)
                 return hf.money("1")
             def request(self, *args, **kwargs):

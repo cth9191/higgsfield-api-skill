@@ -3,6 +3,12 @@
   "source_url": "https://console.higgsfield.ai/models/bytedance%2Fseedance-2.5%2Ftext-to-video/api-reference#model-api-reference",
   "verified_at": "2026-09-16",
   "environment": "production",
+  "pricing": {
+    "method": "per_second_rate_from_description",
+    "reference_aspect_ratio": "16:9",
+    "verified_at": "2026-09-28",
+    "note": "POST /estimate returns only a text pricing_description (no usd). The helper multiplies the quoted per-second rate for the requested resolution by duration; non-16:9 results are approximate."
+  },
   "input_schema": {
     "type": "object",
     "required": ["prompt"],

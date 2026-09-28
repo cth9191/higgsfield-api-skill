@@ -19,6 +19,8 @@ from urllib.request import Request, HTTPRedirectHandler, build_opener
 from uuid import UUID
 
 BASE = "https://api.higgsfield.ai"
+# Cloudflare in front of the API rejects urllib's default "Python-urllib/x.y" agent (error 1010).
+USER_AGENT = "higgsfield-api-skill/1.0"
 TERMINAL = {"completed", "failed", "nsfw", "canceled"}
 REMOTE_STATES = TERMINAL | {"queued", "in_progress"}
 RELEASED = {"rejected", "failed", "nsfw", "canceled"}
@@ -131,7 +133,7 @@ class Client:
     def request(self, method, url, payload=None, timeout=30):
         api_url(url)
         data = None if payload is None else json.dumps(payload, allow_nan=False).encode()
-        req = Request(url, data=data, method=method, headers={"Authorization": self._auth, "Content-Type": "application/json"})
+        req = Request(url, data=data, method=method, headers={"Authorization": self._auth, "Content-Type": "application/json", "User-Agent": USER_AGENT})
         try:
             with build_opener(NoRedirect()).open(req, timeout=timeout) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
@@ -148,11 +150,47 @@ class Client:
         except (ValueError, UnicodeError):
             raise ClientError("Invalid JSON response; submission outcome may be unknown") from None
 
-    def estimate(self, model, payload):
+    def estimate(self, model, payload, profile=None):
         result = self.request("POST", f"{BASE}/estimate/{model}", payload)
-        if "usd" not in result:
-            raise ClientError("Estimate missing USD amount; no generation submitted")
-        return money(result["usd"])
+        if "usd" in result:
+            self.estimate_basis = "api"
+            return money(result["usd"])
+        pricing = (profile or {}).get("pricing")
+        if pricing and result.get("type") == "description":
+            amount, self.estimate_basis = described_estimate(result, pricing, profile, payload)
+            return amount
+        raise ClientError("Estimate missing USD amount; no generation submitted")
+
+
+RATE = re.compile(r"\$(\d+(?:\.\d+)?)(?: per second of generated video)? at (\d{3,4}p)\b")
+
+
+def described_estimate(result, pricing, profile, payload):
+    """Price a request from a text-only estimate: published per-second rate x duration. Fails closed."""
+    if pricing.get("method") != "per_second_rate_from_description":
+        raise ClientError("Unsupported pricing method in profile; no generation submitted")
+    text = result.get("pricing_description")
+    reference = pricing["reference_aspect_ratio"]
+    if not isinstance(text, str) or f"For {reference} video" not in text or "per second" not in text:
+        raise ClientError("Estimate description changed shape; update the model profile before generating")
+    per_second = [sentence for sentence in text.split(". ") if "per second" in sentence]
+    if len(per_second) != 1:
+        raise ClientError("Estimate description changed shape; update the model profile before generating")
+    rates = {}
+    for value, resolution in RATE.findall(per_second[0]):
+        if resolution in rates:
+            raise ClientError("Estimate description lists a resolution twice; no generation submitted")
+        rates[resolution] = money(value)
+    props = profile["input_schema"]["properties"]
+    resolution = payload.get("resolution", props["resolution"].get("default"))
+    duration = payload.get("duration", props["duration"].get("default"))
+    if resolution not in rates or not isinstance(duration, int) or duration <= 0:
+        raise ClientError(f"Estimate description has no per-second rate for {resolution}; no generation submitted")
+    aspect = payload.get("aspect_ratio", props.get("aspect_ratio", {}).get("default"))
+    basis = f"computed: {rates[resolution]} USD/s at {resolution} x {duration}s, from the published {reference} rate"
+    if aspect != reference:
+        basis += f" (approximate for {aspect}: output dimensions are not published)"
+    return money(rates[resolution] * duration), basis
 
 
 class Store:
@@ -227,7 +265,7 @@ def submit(store, client, profile, payload, name, budget=None, limit=None):
     result = existing()
     if result:
         return result
-    estimate = client.estimate(model, payload)
+    estimate = client.estimate(model, payload, profile)
     # Acquire a write lock, recheck duplicates, and reserve before any paid POST.
     try:
         store.db.execute("BEGIN IMMEDIATE")
@@ -253,6 +291,8 @@ def submit(store, client, profile, payload, name, budget=None, limit=None):
         raise
     try:
         result = client.request("POST", f"{BASE}/{model}", payload)
+        # Persist the raw acceptance before validating it, so a request ID is never lost.
+        store.update(name, response_json=json.dumps(result))
         save_remote(store, name, result, require_url=True)
     except Exception as exc:
         rejected = isinstance(exc, ApiError) and exc.code in (400, 401, 403, 404, 422, 423, 429)
@@ -278,10 +318,14 @@ def save_remote(store, name, result, require_url=False):
         return
     fields = {"status": status, "request_id": rid, "response_json": json.dumps(result)}
     if "status_url" in result:
-        url = api_url(result["status_url"])
-        if urlsplit(url).path != f"/requests/{rid}/status" or urlsplit(url).query:
-            raise ClientError("Status URL does not match the accepted request")
-        fields["status_url"] = url
+        documented = f"{BASE}/requests/{rid}/status"
+        reported = str(result["status_url"])
+        if reported != documented and not previous["request_id"]:
+            # Credentials only ever go to the documented endpoint, derived from the request ID.
+            p = urlsplit(reported)
+            print(json.dumps({"note": "status_url differs from the documented endpoint; polling the documented one",
+                              "reported_host": p.netloc, "reported_path_matches": p.path == f"/requests/{rid}/status"}), file=sys.stderr)
+        fields["status_url"] = documented
     elif require_url and status not in TERMINAL:
         # Preserve the known request ID for manual recovery, without resubmitting.
         store.update(name, request_id=rid)
@@ -368,7 +412,7 @@ def download(store, client, name, directory):
         # Exclusive partial file prevents concurrent writers or accidental overwrite.
         with partial.open("xb") as output:
             try:
-                with build_opener(NoRedirect()).open(Request(url), timeout=60) as response:
+                with build_opener(NoRedirect()).open(Request(url, headers={"User-Agent": USER_AGENT}), timeout=60) as response:
                     total = 0
                     while chunk := response.read(1024 * 1024):
                         total += len(chunk)
@@ -404,7 +448,7 @@ def upload(client, filename):
     headers = info["upload_headers"]
     if not isinstance(headers, dict) or any(k.lower() in ("authorization", "cookie", "proxy-authorization", "host") for k in headers):
         raise ClientError("Unexpected storage upload headers")
-    req = Request(url, data=path.read_bytes(), headers=headers, method="PUT")
+    req = Request(url, data=path.read_bytes(), headers={**headers, "User-Agent": USER_AGENT}, method="PUT")
     with build_opener(NoRedirect()).open(req, timeout=60) as response:
         if not 200 <= response.status < 300:
             raise ClientError("Storage upload failed")
@@ -443,7 +487,8 @@ def main(argv=None):
         else:
             client = Client()
             if args.command == "estimate":
-                result = {"estimated_usd": str(client.estimate(model, payload)), "model": model}
+                usd = client.estimate(model, payload, profile)
+                result = {"estimated_usd": str(usd), "estimate_basis": client.estimate_basis, "model": model}
             elif args.command == "upload":
                 result = upload(client, args.file)
             else:
